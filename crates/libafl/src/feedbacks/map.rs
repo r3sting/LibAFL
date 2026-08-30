@@ -32,7 +32,7 @@ use crate::{
     executors::ExitKind,
     feedbacks::{Feedback, HasObserverHandle, StateInitializer},
     monitors::stats::{AggregatorOps, UserStats, UserStatsValue, user_stats::TAG_MAP},
-    observers::{CanTrack, MapObserver},
+    observers::{CanTrack, MapObserver, range_map::range_union},
     state::HasExecutions,
 };
 
@@ -69,6 +69,33 @@ pub type MaxMapPow2Feedback<C, O> = MapFeedback<C, NextPow2IsNovel, O, MaxReduce
 /// A [`MapFeedback`] that strives to maximize the map contents,
 /// but only, if a value is either `T::one()` or `T::max_value()`.
 pub type MaxMapOneOrFilledFeedback<C, O> = MapFeedback<C, OneOrFilledIsNovel, O, MaxReducer>;
+
+/// A [`Reducer`] that unions two input-range map entries: the `min` of the low (`lo`)
+/// nibbles and the `max` of the high (`hi`) nibbles.
+///
+/// See [`crate::observers::InputRangeMapObserver`] for the encoding.
+#[derive(Debug, Clone)]
+pub struct RangeUnionReducer {}
+
+impl Reducer<u8> for RangeUnionReducer {
+    #[inline]
+    fn reduce(history: u8, new: u8) -> u8 {
+        range_union(history, new)
+    }
+}
+
+/// A [`MapFeedback`] over an [`crate::observers::InputRangeMapObserver`] that considers an
+/// input interesting when it *widens* the range of values observed at some map entry.
+///
+/// Pairing [`RangeUnionReducer`] with [`DifferentIsNovel`] is what expresses "widened", and
+/// no dedicated `IsNovel` is needed: [`MapFeedback`] evaluates
+/// `N::is_novel(existing, R::reduce(existing, observed))`, and because the union is monotone
+/// the reduced value differs from the history entry *exactly* when `lo` was pushed down or
+/// `hi` was pushed up.
+///
+/// Note this is built on [`MapFeedback`] directly rather than on
+/// [`super::simd::SimdMapFeedback`], which requires a `SimdReducer`.
+pub type InputRangeMapFeedback<C, O> = MapFeedback<C, DifferentIsNovel, O, RangeUnionReducer>;
 
 /// A `IsNovel` function is used to discriminate if a reduced value is considered novel.
 pub trait IsNovel<T> {
@@ -589,7 +616,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::feedbacks::{AllIsNovel, IsNovel, NextPow2IsNovel};
+    use libafl_bolts::simd::Reducer;
+
+    use crate::{
+        feedbacks::{AllIsNovel, DifferentIsNovel, IsNovel, NextPow2IsNovel, RangeUnionReducer},
+        observers::range_map::{RANGE_EMPTY, pack_range},
+    };
 
     #[test]
     fn test_map_is_novel() {
@@ -609,5 +641,35 @@ mod tests {
         assert!(!NextPow2IsNovel::is_novel(255_u8, 128));
         assert!(NextPow2IsNovel::is_novel(254_u8, 255));
         assert!(!NextPow2IsNovel::is_novel(255_u8, 255));
+    }
+
+    /// The exact decision `InputRangeMapFeedback` makes: reduce, then ask whether the
+    /// reduced value differs from the history entry.
+    fn range_is_interesting(history: u8, observed: u8) -> bool {
+        DifferentIsNovel::is_novel(history, RangeUnionReducer::reduce(history, observed))
+    }
+
+    #[test]
+    fn test_range_map_widening_is_novel() {
+        let history = pack_range(5, 7);
+
+        // hi pushed up
+        assert!(range_is_interesting(history, pack_range(5, 9)));
+        // lo pushed down
+        assert!(range_is_interesting(history, pack_range(2, 7)));
+        // both
+        assert!(range_is_interesting(history, pack_range(0, 15)));
+
+        // strictly inside the known range: not novel
+        assert!(!range_is_interesting(history, pack_range(6, 6)));
+        assert!(!range_is_interesting(history, pack_range(5, 7)));
+
+        // the very first observation at an entry always widens
+        assert!(range_is_interesting(RANGE_EMPTY, pack_range(6, 6)));
+        // ... and the history absorbs it exactly
+        assert_eq!(
+            RangeUnionReducer::reduce(RANGE_EMPTY, pack_range(6, 6)),
+            pack_range(6, 6)
+        );
     }
 }

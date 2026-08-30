@@ -31,6 +31,9 @@ pub use multi_map::*;
 pub mod owned_map;
 pub use owned_map::*;
 
+pub mod range_map;
+pub use range_map::*;
+
 /// A trait indicating tracking of observed map values after testcase execution
 ///
 /// Trait marker which indicates that this [`MapObserver`] is tracked for indices or novelties.
